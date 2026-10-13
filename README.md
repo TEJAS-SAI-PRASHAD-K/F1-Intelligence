@@ -8,8 +8,8 @@ real data rather than a tutorial dataset.
 | Phase | Feature | Status |
 |---|---|---|
 | 1 | Data foundation — ingest FastF1 timing data into Postgres | **done** |
-| 2 | Tire degradation model | next |
-| 3 | Pit stop strategy simulator | planned |
+| 2 | Tire degradation model | **done** |
+| 3 | Pit stop strategy simulator | next |
 | 4 | Race prediction | planned |
 | 5 | Dashboard API | planned |
 
@@ -84,7 +84,21 @@ GET /api/v1/sessions/{id}/results
 GET /api/v1/sessions/{id}/stints
 GET /api/v1/sessions/{id}/pit-stops
 GET /api/v1/drivers
+
+POST /api/v1/tire/degradation        Predicted lap-time loss as a tire ages
+GET  /api/v1/tire/stints/{id}        Measured per-stint degradation (Stage A OLS)
+GET  /api/v1/tire/model-info         Active model, holdout metrics, baseline
 ```
+
+## Train the tire model
+
+```bash
+.venv/bin/python -m app.ml.tire.train
+```
+
+Builds `features.stint_laps`, fits Ridge / XGBoost / HistGradientBoosting, validates with
+`GroupKFold` by session plus a held-out season, and registers the result in `ml.model_versions`.
+Artifacts land in `models/` (gitignored) — XGBoost as JSON, sklearn as joblib.
 
 ## Tests
 
@@ -102,8 +116,12 @@ semantics and CHECK constraints are all genuinely exercised.
 .venv/bin/jupyter lab
 ```
 
-`notebooks/01_explore_fastf1.ipynb` walks through the raw data and the six places it will
-mislead you. Read it before trusting anything downstream.
+`notebooks/01_explore_fastf1.ipynb` walks through the raw data and the places it will mislead you.
+Read it before trusting anything downstream.
+
+`notebooks/02_tire_degradation.ipynb` builds the degradation model, and is really about one
+statistical idea: within a stint, fuel load and tire age are **perfectly collinear**
+(corr = 1.000), so their effects cannot be separated by any algorithm.
 
 ---
 
@@ -121,7 +139,13 @@ app/
     loader.py          idempotent upserts
     cli.py             typer commands
   api/routes/          FastAPI endpoints
-  ml/                  phases 2-4
+  ml/
+    fuel.py            physics-based fuel-load correction
+    categories.py      pinned categorical vocabularies (unseen -> NaN)
+    registry.py        XGBoost->JSON / sklearn->joblib + ml.model_versions
+    tire/              phase 2: dataset, stage_a, train, predict
+    strategy/          phase 3
+    prediction/        phase 4
 ```
 
 ### Three Postgres schemas
@@ -129,7 +153,7 @@ app/
 | schema | holds |
 |---|---|
 | `raw` | ingested FastF1 data, never mutated by modeling code |
-| `features` | derived tables and views built from `raw` |
+| `features` | derived views built from `raw` — currently `features.stint_laps` |
 | `ml` | model metadata, versions, metrics |
 
 The separation means a modeling bug can never corrupt the ingested data, and re-deriving
@@ -191,6 +215,36 @@ WHERE l.is_accurate AND NOT (l.track_status && ARRAY[4,5,6,7]::smallint[])
 ```
 
 ---
+
+## Phase 2 results
+
+Trained on 2019–2023, held out 2024 (21,036 laps):
+
+| model | holdout MAE | r² | vs baseline |
+|---|---|---|---|
+| Baseline ("this lap == its stint median") | 0.5276s | — | — |
+| Stage B Ridge | 0.4913s | 0.129 | +6.9% |
+| Stage C XGBoost (primary) | 0.4885s | 0.126 | +7.4% |
+| Stage C HistGBR (control) | 0.4856s | 0.143 | +8.0% |
+
+All three within 1.2% — once fuel-corrected, degradation is close to linear in tire age.
+Regularisation mattered far more than model choice: 600 trees at depth 6 scored 0.5410s, *worse
+than Ridge*; 120 trees at depth 3 scored 0.4846s.
+
+**Known limitation that matters for Phase 3:** the pooled model predicts a median **68% of the
+degradation rate Stage A measures**, and compresses the spread across circuits ~4×. The
+regularisation that minimised per-lap MAE also flattened the curve. See
+[docs/phase2-tire-degradation.md](docs/phase2-tire-degradation.md) — use Stage A's measured
+`(circuit, compound)` table, or calibrate, before feeding a simulator that integrates it.
+
+## Documentation
+
+| Doc | Covers |
+|---|---|
+| [phase1-data-foundation.md](docs/phase1-data-foundation.md) | Phase 1 design decisions and data gotchas |
+| [phase1-code-walkthrough.md](docs/phase1-code-walkthrough.md) | Phase 1 function by function, with line numbers |
+| [phase2-tire-degradation.md](docs/phase2-tire-degradation.md) | Phase 2 findings, results, limitations |
+| [phase2-code-walkthrough.md](docs/phase2-code-walkthrough.md) | Phase 2 function by function, with line numbers |
 
 ## Data source
 

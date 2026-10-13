@@ -9,7 +9,7 @@ import logging
 
 from fastapi import FastAPI
 
-from app.api.routes import catalog, health, sessions
+from app.api.routes import catalog, health, sessions, tire
 from app.config import get_settings
 
 API_PREFIX = "/api/v1"
@@ -39,6 +39,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(catalog.router, prefix=API_PREFIX)
     app.include_router(sessions.router, prefix=API_PREFIX)
+    app.include_router(tire.router, prefix=API_PREFIX)
     return app
 
 
