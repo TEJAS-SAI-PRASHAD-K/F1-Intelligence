@@ -9,7 +9,15 @@ import logging
 
 from fastapi import FastAPI
 
-from app.api.routes import catalog, health, sessions
+from app.api.routes import (
+    catalog,
+    dashboard,
+    health,
+    prediction,
+    sessions,
+    strategy,
+    tire,
+)
 from app.config import get_settings
 
 API_PREFIX = "/api/v1"
@@ -24,9 +32,17 @@ def create_app() -> FastAPI:
         version="0.1.0",
         description=(
             "Backend for F1 race prediction, tire degradation modeling and pit "
-            "strategy simulation.\n\n"
-            "**Phase 1 (current): data foundation.** Read-only access to ingested "
-            "FastF1 timing data.\n\n"
+            "strategy simulation, built on FastF1 timing data from 2018 onward."
+            "\n\n"
+            "**What each group needs.** `catalog` and `sessions` are read-only "
+            "views of ingested data and need nothing else. `tire` and "
+            "`prediction` serve trained models -- run `python -m app.ml.tire.train` "
+            "and `python -m app.ml.prediction.train` if an endpoint reports no "
+            "registered model. `strategy` measures its own inputs per request by "
+            "default (`degradation_source=stage_a`) and only touches the tire "
+            "model when asked for `degradation_source=model`. `dashboard` reads "
+            "materialized views, which go stale until "
+            "`python -m app.ingestion.cli refresh-views` is run.\n\n"
             "Two things to know when reading lap data:\n"
             "- `track_status` is an array of flags, not a number. `[1]` is clear; "
             "`[1,4]` means the lap was partly clear and partly under safety car.\n"
@@ -39,6 +55,10 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(catalog.router, prefix=API_PREFIX)
     app.include_router(sessions.router, prefix=API_PREFIX)
+    app.include_router(tire.router, prefix=API_PREFIX)
+    app.include_router(strategy.router, prefix=API_PREFIX)
+    app.include_router(prediction.router, prefix=API_PREFIX)
+    app.include_router(dashboard.router, prefix=API_PREFIX)
     return app
 
 
