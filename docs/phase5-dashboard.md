@@ -152,6 +152,62 @@ about 1,000 of them. The race dashboard took **12 seconds per request**.
 Pushing the filter into SQL made it **0.29s**, a 40× improvement, with an identical
 answer. The combinatorics were never the problem; the data volume was.
 
+### The same bug again, one layer down
+
+Building the React frontend made the remaining latency obvious: every race page sat on
+a spinner. `/dashboard/race/92` measured **7.86s** with
+`curl -w "%{time_total}"` on a warm database. Profiling each step of the route in
+process rather than guessing:
+
+| step | seconds | share |
+| --- | --- | --- |
+| `add_degradation_feature` (inside `predict_event`) | 6.80 | 78% |
+| `observed_stint_fits` | 0.20 | 2% |
+| stint aggregate query | 0.14 | 2% |
+| model inference (both models) | 0.03 | <1% |
+| `race_features` read, result query, event lookup | 0.05 | <1% |
+
+So running the model was never the cost — inference on 20 rows is 29ms. The cost was
+`add_degradation_feature` calling `tire.dataset.build_dataset(engine)`: **5.7s to read
+and process all 103,975 laps**, plus 0.9s of Stage A fits, to end up with one number —
+the median prior-season slope at Yas Island.
+
+That is the identical mistake `observed_stint_fits` had already been fixed for, so it
+took the identical fix. `load_stint_laps` and `build_dataset` now accept optional
+`circuits` and `before_season` filters, applied in SQL, and
+`add_degradation_feature` asks only for the circuits its frame mentions and only for
+seasons before the latest one it holds. For one race that is ~2.8k laps instead of
+104k.
+
+The filter is safe because nothing after the read is normalised against a
+dataset-wide statistic: the fuel correction is per row, the target's baseline is a
+within-`stint_key` median, and Stage A fits one stint at a time. Verified rather than
+asserted — the per-stint slopes come back bit-identical, including for the full
+training frame, and `TestFilteredLoad` keeps that property under test.
+
+Measured the same way afterwards:
+
+| endpoint | before | after |
+| --- | --- | --- |
+| `/dashboard/race/92` (Abu Dhabi 2024) | 7.86s | **0.87s** |
+| `/dashboard/race/270` (Australia 2019) | 6.15s | **0.59s** |
+| `/dashboard/race/88` (Qatar 2024) | 7.35s | **0.62s** |
+
+Identical bytes — the before/after JSON for three races compares equal with `cmp`,
+`prediction_note` included. The response is **not** cached and the prediction is still
+run live per request, so it is still the current model's output and still in-sample;
+nothing about the staleness story changed, only the volume of data read.
+
+Full training (`python -m app.ml.prediction.train`) was not slowed: there the filter
+spans every circuit, so it reads the same rows, minus the newest season's laps, which
+an as-of feature can never use. On the whole 2,416-row training frame the step went
+from 8.28s to 6.99s — a side effect, not the point, and the feature values are
+unchanged.
+
+What is left in the 0.6-0.9s is roughly 0.2s of Stage A fits for the stint chart, 0.2s
+of degradation lookup and 0.15s of stint aggregation. Going lower would mean
+materialising, which the per-request numbers no longer justify.
+
 ---
 
 ## A testing decision worth explaining

@@ -33,6 +33,8 @@ simulator needs absolute lap times, not deltas.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
@@ -92,9 +94,41 @@ ID_COLUMNS = [
 _LOAD_SQL = text("SELECT * FROM features.stint_laps")
 
 
-def load_stint_laps(engine: Engine) -> pd.DataFrame:
-    """Read the view. One row per clean, dry, green-flag race lap."""
-    return pd.read_sql(_LOAD_SQL, engine)
+def load_stint_laps(
+    engine: Engine,
+    *,
+    circuits: Sequence[str] | None = None,
+    before_season: int | None = None,
+) -> pd.DataFrame:
+    """Read the view. One row per clean, dry, green-flag race lap.
+
+    The optional filters are applied in SQL, for callers that need a slice
+    rather than the whole 104k-row view. They are a pure row filter: every
+    downstream step in `build_dataset` is per-row or per-stint (the target's
+    baseline is a within-`stint_key` median, and Stage A fits one stint at a
+    time), so a filtered read produces bit-identical rows for the stints it
+    keeps. Nothing here is normalised against a dataset-wide statistic, which
+    is what would make filtering change the numbers.
+
+    `circuits=None` and `before_season=None` mean no filter, so the default is
+    the full view as before.
+    """
+    clauses: list[str] = []
+    params: dict[str, object] = {}
+    if circuits is not None:
+        clauses.append("circuit = ANY(:circuits)")
+        params["circuits"] = list(circuits)
+    if before_season is not None:
+        clauses.append("season_year < :before_season")
+        params["before_season"] = int(before_season)
+
+    if not clauses:
+        return pd.read_sql(_LOAD_SQL, engine)
+
+    sql = text(
+        "SELECT * FROM features.stint_laps WHERE " + " AND ".join(clauses)
+    )
+    return pd.read_sql(sql, engine, params=params)
 
 
 def add_fuel_correction(df: pd.DataFrame) -> pd.DataFrame:
@@ -196,9 +230,18 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_dataset(engine: Engine) -> pd.DataFrame:
-    """Full pipeline: view -> fuel correction -> target -> features."""
-    df = load_stint_laps(engine)
+def build_dataset(
+    engine: Engine,
+    *,
+    circuits: Sequence[str] | None = None,
+    before_season: int | None = None,
+) -> pd.DataFrame:
+    """Full pipeline: view -> fuel correction -> target -> features.
+
+    `circuits` / `before_season` are passed through to `load_stint_laps`; see
+    there for why filtering the read does not change the rows that survive.
+    """
+    df = load_stint_laps(engine, circuits=circuits, before_season=before_season)
     if df.empty:
         return df
     df = add_fuel_correction(df)

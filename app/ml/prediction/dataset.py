@@ -90,13 +90,35 @@ def add_degradation_feature(df: pd.DataFrame, engine: Engine) -> pd.DataFrame:
     So the rate for a race in season Y is measured only from seasons < Y. The
     first season in the data therefore has no rate at all, which is correct:
     nothing was known yet. Both model families handle the resulting NaN.
+
+    Only the circuits and prior seasons `df` actually asks about are read, and
+    the filter is pushed into SQL -- the same fix `tire.predict.observed_stint_fits`
+    documents. Reading the whole view and discarding most of it is what made the
+    Phase 5 race dashboard take ~8.7s per request: predicting ONE race needs one
+    circuit's prior stints (~2.8k laps), not all 104k. For a full training frame
+    the filter spans every circuit and so loads the same rows as before; the
+    only rows it drops there are the newest season's, which an as-of feature
+    can never use. Slopes are unchanged either way, because Stage A fits each
+    stint on its own -- see `tire.dataset.load_stint_laps`.
     """
     from app.ml.tire import dataset as tire_ds
     from app.ml.tire import stage_a
 
-    laps = tire_ds.build_dataset(engine)
+    seasons = sorted(df["season_year"].unique())
+    circuits = sorted({str(c) for c in df["circuit"].dropna().unique()})
+    laps = tire_ds.build_dataset(
+        engine,
+        circuits=circuits,
+        before_season=int(max(seasons)) if seasons else None,
+    )
     out = df.copy()
     out[DEGRADATION_FEATURE] = np.nan
+
+    # No prior stints for these circuits at all -- the first season in the data,
+    # or a circuit never raced before. The feature stays NaN, which is the same
+    # answer the unfiltered read gave, reached without the loop.
+    if laps.empty:
+        return out
 
     for season in sorted(out["season_year"].unique()):
         prior = laps[laps["season_year"] < season]
