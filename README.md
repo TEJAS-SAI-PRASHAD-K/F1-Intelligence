@@ -9,9 +9,11 @@ real data rather than a tutorial dataset.
 |---|---|---|
 | 1 | Data foundation — ingest FastF1 timing data into Postgres | **done** |
 | 2 | Tire degradation model | **done** |
-| 3 | Pit stop strategy simulator | next |
-| 4 | Race prediction | planned |
-| 5 | Dashboard API | planned |
+| 3 | Pit stop strategy simulator | **done** |
+| 4 | Race prediction | **done** |
+| 5 | Dashboard API | **done** |
+
+All five phases are complete: **22 endpoints, 279 tests, 6 seasons of data.**
 
 The order is deliberate. Tire degradation is a clean regression problem with ~150k rows per
 season, which makes it the right first model. The pit simulator consumes the tire model. Race
@@ -88,7 +90,38 @@ GET /api/v1/drivers
 POST /api/v1/tire/degradation        Predicted lap-time loss as a tire ages
 GET  /api/v1/tire/stints/{id}        Measured per-stint degradation (Stage A OLS)
 GET  /api/v1/tire/model-info         Active model, holdout metrics, baseline
+
+POST /api/v1/strategy/simulate       Rank pit strategies, deterministic + Monte Carlo
+POST /api/v1/strategy/compare        Your own strategies, head to head
+GET  /api/v1/strategy/inputs/{c}     The measured inputs driving a circuit
+
+GET  /api/v1/prediction/race/{id}    What the model says about a past race
+POST /api/v1/prediction/race         Predict an upcoming race from a grid
+GET  /api/v1/prediction/backtest     Walk-forward metrics, beside the baselines
+
+GET  /api/v1/dashboard/season/{year} Standings, constructors, per-circuit pace
+GET  /api/v1/dashboard/driver/{abbr} Career record, best and worst circuits
+GET  /api/v1/dashboard/race/{id}     Result, stint chart, prediction vs actual
+GET  /api/v1/dashboard/models        Every registered model and its metrics
 ```
+
+## Train the prediction model
+
+```bash
+.venv/bin/python -m app.ml.prediction.train
+```
+
+Runs a leakage audit first and **refuses to train if it fails**, then walk-forward
+backtests Ridge / RandomForest / XGBoost over 81 races and registers the winner.
+
+## Refresh the dashboard
+
+```bash
+.venv/bin/python -m app.ingestion.cli refresh-views
+```
+
+Rebuilds the three materialized views. Run after every ingest — plain views are always
+current, only materialized ones go stale.
 
 ## Train the tire model
 
@@ -123,6 +156,10 @@ Read it before trusting anything downstream.
 statistical idea: within a stint, fuel load and tire age are **perfectly collinear**
 (corr = 1.000), so their effects cannot be separated by any algorithm.
 
+`notebooks/03_pit_strategy.ipynb` turns those rates into a decision. Its lesson is to look for the
+closed form before reaching for simulation — one line of algebra gives the optimal stop count, a
+derivable threshold, and a test oracle.
+
 ---
 
 ## Architecture
@@ -144,8 +181,8 @@ app/
     categories.py      pinned categorical vocabularies (unseen -> NaN)
     registry.py        XGBoost->JSON / sklearn->joblib + ml.model_versions
     tire/              phase 2: dataset, stage_a, train, predict
-    strategy/          phase 3
-    prediction/        phase 4
+    strategy/          phase 3: inputs, enumerate, simulator, monte_carlo
+    prediction/        phase 4: dataset, train, predict
 ```
 
 ### Three Postgres schemas
@@ -153,7 +190,7 @@ app/
 | schema | holds |
 |---|---|
 | `raw` | ingested FastF1 data, never mutated by modeling code |
-| `features` | derived views built from `raw` — currently `features.stint_laps` |
+| `features` | views: `stint_laps`, `pit_loss`, `race_conditions`, `race_features`; matviews: `mv_driver_season`, `mv_team_season`, `mv_circuit_season` |
 | `ml` | model metadata, versions, metrics |
 
 The separation means a modeling bug can never corrupt the ingested data, and re-deriving
@@ -237,6 +274,65 @@ regularisation that minimised per-lap MAE also flattened the curve. See
 [docs/phase2-tire-degradation.md](docs/phase2-tire-degradation.md) — use Stage A's measured
 `(circuit, compound)` table, or calibrate, before feeding a simulator that integrates it.
 
+## Phase 3 results
+
+Strategies ranked by an exhaustive search (701,552 candidates at Sakhir) scored by a closed form,
+then re-run across thousands of Monte Carlo races with safety cars.
+
+| circuit | laps | pit loss | mean wear | best | real-world |
+|---|---|---|---|---|---|
+| Monaco | 78 | 22.4s | 0.010 s/lap | **1-stop** | always a 1-stop |
+| Monza | 53 | 25.9s | 0.052 s/lap | **1-stop** | Leclerc won 2024 on a 1-stop |
+| Sakhir | 57 | 24.5s | 0.112 s/lap | **2-stop** | classically a 2-stop |
+
+The whole trade-off is one line — `slope * L*(L-1)/2 + stops * pit_loss` — from which stint order
+provably cannot matter, long stints are punished quadratically, and the 1-stop/2-stop threshold is
+**derivable** (0.106 s/lap at 50 laps, 22s pit loss). Brute force agrees with the algebra exactly.
+
+**Why Phase 2's finding mattered.** Switching `degradation_source` from the measured Stage A table
+to the Phase 2 pooled model changes the Sakhir recommendation from **2-stop to 1-stop** — the
+model's ~40% flatness is not a small error downstream, it is a different decision.
+
+## Phase 4 results
+
+Walk-forward backtest over 81 races (train on everything before race N, predict race N):
+
+| | MAE (positions) | Spearman | top-3 | top-1 |
+|---|---|---|---|---|
+| baseline: grid order | 3.522 | +0.604 | 59.7% | 44.4% |
+| **Ridge** | **3.136** | **+0.677** | **66.3%** | **56.8%** |
+| Random forest | 3.218 | +0.676 | 60.1% | 54.3% |
+| XGBoost | 3.226 | +0.671 | 61.3% | 54.3% |
+
+**+11.0% over the grid baseline**, which is strong because overtaking is hard. Podium
+probability is well calibrated (Brier 0.069 vs 0.128 base rate, **+45.6% skill**): predicted
+0.70 → observed 0.71.
+
+**Ridge wins** — the mirror image of Phase 2, where a booster won on 104k rows. With 2,416
+rows the linear model is best. *The amount of data decides the model.*
+
+The leakage guard is a window frame ending at `1 PRECEDING`, using `GROUPS` not `ROWS`.
+With `ROWS`, a team-level feature reaches the driver's own teammate **in the race being
+predicted** — see [docs/phase4-race-prediction.md](docs/phase4-race-prediction.md) for the
+Ferrari table that demonstrates it.
+
+## Phase 5 results
+
+2024 dashboard, straight from the materialized views:
+
+| driver | team | points | wins | podiums |
+|---|---|---|---|---|
+| VER | Red Bull Racing | 399 | 9 | 14 |
+| NOR | McLaren | 344 | 4 | 13 |
+| LEC | Ferrari | 327 | 3 | 13 |
+
+Constructors: McLaren 609, Ferrari 595, Red Bull 537 — McLaren won that championship.
+Points are **race-only** (sprints were never ingested), and every response says so.
+
+`tire_mgmt_s_per_lap` measures a driver's degradation slope **relative to the field median
+in the same race**, which cancels the fuel effect exactly without needing the fuel model.
+Sainz and Alonso lead it, both genuinely known for tire management.
+
 ## Documentation
 
 | Doc | Covers |
@@ -245,6 +341,12 @@ regularisation that minimised per-lap MAE also flattened the curve. See
 | [phase1-code-walkthrough.md](docs/phase1-code-walkthrough.md) | Phase 1 function by function, with line numbers |
 | [phase2-tire-degradation.md](docs/phase2-tire-degradation.md) | Phase 2 findings, results, limitations |
 | [phase2-code-walkthrough.md](docs/phase2-code-walkthrough.md) | Phase 2 function by function, with line numbers |
+| [phase3-pit-strategy.md](docs/phase3-pit-strategy.md) | Phase 3 findings, results, limitations |
+| [phase3-code-walkthrough.md](docs/phase3-code-walkthrough.md) | Phase 3 function by function, with line numbers |
+| [phase4-race-prediction.md](docs/phase4-race-prediction.md) | Phase 4 findings, the leakage guards, results |
+| [phase4-code-walkthrough.md](docs/phase4-code-walkthrough.md) | Phase 4 function by function, with line numbers |
+| [phase5-dashboard.md](docs/phase5-dashboard.md) | Phase 5 findings, materialized views, caveats |
+| [phase5-code-walkthrough.md](docs/phase5-code-walkthrough.md) | Phase 5 function by function, with line numbers |
 
 ## Data source
 
