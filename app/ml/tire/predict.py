@@ -216,11 +216,29 @@ def observed_stint_fits(engine, session_id: int) -> pd.DataFrame:
     This is the empirical counterpart to `predict_curve`: what the stints in
     that race actually did, rather than what the model expects. Comparing the
     two is how you sanity-check a prediction against reality.
+
+    Filters in SQL, not in pandas. The obvious implementation calls
+    `ds.build_dataset(engine)` and then selects one session from the result --
+    which loads ~104,000 rows and runs the whole fuel-correction and target
+    pipeline to keep about 1,000 of them. That made the Phase 5 race dashboard
+    take 12 seconds per request. Pushing the filter into the query makes it
+    ~0.2s and changes nothing about the answer.
     """
+    from sqlalchemy import text as sql_text
+
     from app.ml.tire import stage_a
 
-    df = ds.build_dataset(engine)
-    subset = df[df["session_id"] == session_id]
+    subset = pd.read_sql(
+        sql_text("SELECT * FROM features.stint_laps WHERE session_id = :sid"),
+        engine,
+        params={"sid": session_id},
+    )
+    if subset.empty:
+        return pd.DataFrame()
+
+    subset = ds.add_fuel_correction(subset)
+    subset = ds.add_target(subset)
+    subset = ds.add_features(subset)
     if subset.empty:
         return pd.DataFrame()
     return stage_a.fit_all_stints(subset, min_laps=5, use_fuel_correction=True)
