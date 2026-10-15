@@ -171,6 +171,56 @@ def status() -> None:
         typer.echo(f"{'accurate':10}: {accurate:,} ({accurate / counts['laps']:.0%} of laps)")
 
 
+# Materialized views backing the Phase 5 dashboard. Order does not matter --
+# none depends on another.
+MATERIALIZED_VIEWS = (
+    "features.mv_driver_season",
+    "features.mv_team_season",
+    "features.mv_circuit_season",
+)
+
+
+@app.command()
+def refresh_views(
+    concurrently: bool = typer.Option(
+        True,
+        "--concurrently/--blocking",
+        help="CONCURRENTLY keeps the dashboard readable while rebuilding.",
+    ),
+) -> None:
+    """Rebuild the dashboard's materialized views. Run after every ingest.
+
+    Plain views (`features.stint_laps`, `pit_loss`, `race_conditions`,
+    `race_features`) need nothing -- they are queries and always current. Only
+    the MATERIALIZED views store a snapshot and go stale.
+
+    CONCURRENTLY keeps the old contents readable while the new ones build, so
+    the dashboard never serves an empty table. It requires a UNIQUE index on
+    each view, which the Phase 5 migration creates; without one Postgres fails
+    at refresh time rather than at creation.
+    """
+    _setup_logging(False)
+    mode = "CONCURRENTLY " if concurrently else ""
+
+    with SessionLocal() as db:
+        for view in MATERIALIZED_VIEWS:
+            started = time.perf_counter()
+            try:
+                # Each refresh commits on its own so one failure does not roll
+                # back the views that already succeeded.
+                db.execute(text(f"REFRESH MATERIALIZED VIEW {mode}{view}"))
+                db.commit()
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                typer.secho(f"[FAIL] {view}: {str(exc)[:120]}", fg=typer.colors.RED)
+                continue
+            rows = db.execute(text(f"SELECT count(*) FROM {view}")).scalar() or 0
+            typer.secho(
+                f"[ OK ] {view:<34} {rows:>6,} rows  ({time.perf_counter() - started:.1f}s)",
+                fg=typer.colors.GREEN,
+            )
+
+
 @app.command()
 def doctor() -> None:
     """Run data-quality checks against the ingested data.
@@ -183,9 +233,22 @@ def doctor() -> None:
 
     checks: list[tuple[str, str, str]] = [
         (
-            "laps with no track_status",
-            "SELECT count(*) FROM raw.laps WHERE track_status IS NULL",
-            "zero expected: unknown status should be rare and worth investigating",
+            # Checks the CONSEQUENCE, not the symptom. NULL track_status does
+            # occur -- 23 laps from 2020 races, where FastF1 supplied no status
+            # at all -- and that is harmless, because every one of them is also
+            # is_accurate = false and so is excluded anyway.
+            #
+            # The first version of this check asserted zero NULLs outright and
+            # started failing when the 2019-2022 backfill landed. It was
+            # conflating "unusual" with "harmful". What actually matters is
+            # whether an unknown-status lap can reach a model, so that is what
+            # is asserted now.
+            "unknown-status laps reaching the modeling filter",
+            """SELECT count(*) FROM raw.laps
+               WHERE track_status IS NULL
+                 AND is_accurate
+                 AND lap_time_ms IS NOT NULL""",
+            "must be zero -- a lap we cannot vouch for must not reach a model",
         ),
         (
             "orphaned laps",
@@ -284,6 +347,16 @@ def doctor() -> None:
 
         # Informational, not pass/fail.
         typer.echo()
+        unknown_status = db.execute(
+            text("SELECT count(*) FROM raw.laps WHERE track_status IS NULL")
+        ).scalar() or 0
+        if unknown_status:
+            typer.echo(
+                f"note: {unknown_status:,} laps have no track_status at all "
+                "(FastF1 supplied none). All are is_accurate = false, so they are "
+                "excluded from modeling regardless."
+            )
+
         rows = db.execute(
             text(
                 """SELECT count(*) AS total,

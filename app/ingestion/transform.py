@@ -214,16 +214,44 @@ def transform_event(event: pd.Series, year: int) -> dict[str, Any]:
     }
 
 
+# FastF1 reports `Location` inconsistently across seasons, producing two rows
+# for one physical track: "Monte Carlo" in 2019/2021 but "Monaco" from 2022,
+# "Singapore" in 2019 but "Marina Bay" from 2023. Left alone that fragments
+# every per-circuit statistic -- Monaco's pit loss split into 34 and 28 stops,
+# and the Phase 2 model saw two unrelated categorical levels for one track.
+#
+# Only names for the SAME physical circuit belong here. Hockenheim/Nurburgring,
+# Monza/Imola/Mugello and Austin/Miami/Las Vegas share a country but are
+# genuinely different tracks.
+CIRCUIT_NAME_ALIASES = {
+    "Monte Carlo": "Monaco",
+    "Monte-Carlo": "Monaco",
+    "Singapore": "Marina Bay",
+}
+
+
+def canonical_circuit_name(name: str | None) -> str | None:
+    """Collapse FastF1's naming variants onto one name per physical circuit."""
+    if name is None:
+        return None
+    return CIRCUIT_NAME_ALIASES.get(name, name)
+
+
 def transform_circuit(event: pd.Series) -> dict[str, Any]:
     """Circuit identity comes from the event's Location/Country.
 
     The schedule carries no latitude/longitude, so those stay NULL. None of
     the four features need coordinates.
+
+    `name` is canonicalised (see CIRCUIT_NAME_ALIASES) because it is the
+    UNIQUE key, so a naming variant would create a second row for one track.
+    `locality` keeps whatever FastF1 actually said, so the raw value is not lost.
     """
+    location = to_str(event.get("Location"), 128)
     return {
-        "name": to_str(event.get("Location"), 128) or "Unknown",
+        "name": canonical_circuit_name(location) or "Unknown",
         "country": to_str(event.get("Country"), 64),
-        "locality": to_str(event.get("Location"), 64),
+        "locality": location[:64] if location else None,
     }
 
 
