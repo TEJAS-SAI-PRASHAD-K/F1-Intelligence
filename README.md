@@ -76,6 +76,13 @@ so re-runs are fast.
 
 Interactive docs at <http://localhost:8000/docs>.
 
+A browser on another origin -- a frontend dev server, say -- can only read a response if
+its origin is allowed. `CORS_ORIGINS` is a comma-separated list and defaults to the Vite
+dev server on both spellings of loopback
+(`http://localhost:5173,http://127.0.0.1:5173`), because a browser treats those as
+different origins. Deliberately not `*`: a wildcard would let any page the developer
+visits read this API, so a deployment names its own frontend origin instead.
+
 ```
 GET /health
 GET /api/v1/seasons

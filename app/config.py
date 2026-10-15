@@ -26,8 +26,27 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Browser origins allowed to call the API, comma-separated in the env var
+    # (CORS_ORIGINS=https://a.example,https://b.example). The default is the
+    # Vite dev server on both spellings of localhost, because a browser treats
+    # http://localhost:5173 and http://127.0.0.1:5173 as different origins.
+    #
+    # Deliberately NOT "*": with a wildcard any page the developer visits can
+    # read this API. A deployment is expected to set the variable; if it does
+    # not, the dev default fails closed rather than opening up.
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
     # Echo SQL to stdout. Useful when learning what the ORM actually emits.
     sql_echo: bool = False
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """`cors_origins` split into the list CORSMiddleware wants.
+
+        Blank entries are dropped so a trailing comma in a .env file is not read
+        as an empty origin, which would never match anything.
+        """
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
     def fastf1_cache_path(self) -> Path:

@@ -214,3 +214,74 @@ class TestBaseline:
     def test_baseline_is_positive_for_a_degrading_stint(self):
         df = ds.add_target(ds.add_fuel_correction(_stint_frame(degradation_ms_per_lap=60.0)))
         assert ds.baseline_mae_ms(df) > 0
+
+
+class TestFilteredLoad:
+    """The filtered read must not change the answer.
+
+    `add_degradation_feature` only needs one circuit's prior stints, and reading
+    the whole 104k-row view to keep ~2.8k of them was most of the ~8.7s the race
+    dashboard took. Pushing the filter into SQL is only safe because every step
+    after the read is per-row or per-stint, so these tests assert that property
+    directly instead of trusting the reasoning.
+
+    Two filtered reads are compared rather than a filtered read against the full
+    one: the full-view read plus pipeline costs several seconds, and the
+    invariant under test -- that neighbouring circuits do not influence each
+    other's fits -- is visible without it.
+    """
+
+    @pytest.fixture(scope="class")
+    def circuits(self) -> list[str]:
+        from sqlalchemy import text
+
+        from app.db.base import engine
+
+        found = pd.read_sql(
+            text("SELECT DISTINCT circuit FROM features.stint_laps ORDER BY circuit"),
+            engine,
+        )["circuit"].tolist()
+        if len(found) < 2:
+            pytest.skip("needs at least two circuits ingested")
+        return found[:2]
+
+    def test_slopes_do_not_depend_on_which_other_circuits_were_read(self, circuits):
+        from app.db.base import engine
+        from app.ml.tire import stage_a
+
+        first, second = circuits
+
+        together = stage_a.fit_all_stints(
+            ds.build_dataset(engine, circuits=[first, second])
+        )
+        alone = stage_a.fit_all_stints(ds.build_dataset(engine, circuits=[first]))
+
+        from_pair = (
+            together[together["circuit"] == first]
+            .set_index("stint_key")["slope"]
+            .sort_index()
+        )
+        from_single = alone.set_index("stint_key")["slope"].sort_index()
+
+        assert len(from_single) > 0
+        assert list(from_pair.index) == list(from_single.index)
+        # Bit-identical, not approximately equal: the rows are the same rows.
+        assert (from_pair.to_numpy() == from_single.to_numpy()).all()
+
+    def test_before_season_excludes_the_named_season(self, circuits):
+        """The as-of degradation feature for season Y may only see seasons < Y;
+        a boundary that leaked by one would leak the race being predicted."""
+        from app.db.base import engine
+
+        all_seasons = ds.build_dataset(engine, circuits=circuits)["season_year"]
+        cutoff = int(all_seasons.max())
+
+        prior = ds.build_dataset(engine, circuits=circuits, before_season=cutoff)
+        assert not prior.empty
+        assert int(prior["season_year"].max()) < cutoff
+
+    def test_circuit_filter_returns_only_that_circuit(self, circuits):
+        from app.db.base import engine
+
+        rows = ds.load_stint_laps(engine, circuits=[circuits[0]])
+        assert set(rows["circuit"].unique()) == {circuits[0]}

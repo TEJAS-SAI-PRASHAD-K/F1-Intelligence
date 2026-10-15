@@ -108,3 +108,78 @@ class TestStints:
         # Green laps 6,8,9,10 -> tyre_life 1,3,4,5 -> 84100,84300,84400,84500
         assert second["median_green_lap_time_ms"] == 84_350
         assert second["median_green_lap_time_ms"] < 90_000
+
+
+class TestCors:
+    """CORS is what lets the separate frontend read a response at all.
+
+    Without `Access-Control-Allow-Origin` the request still reaches the API and
+    still returns 200 -- the browser simply refuses to hand the body to the
+    page, which is why this is easy to miss in curl and impossible to miss in a
+    browser.
+    """
+
+    def test_allows_the_configured_dev_origin(self, client):
+        response = client.get("/health", headers={"Origin": "http://localhost:5173"})
+        assert response.status_code == 200
+        assert (
+            response.headers["access-control-allow-origin"] == "http://localhost:5173"
+        )
+
+    def test_allows_the_loopback_spelling_too(self, client):
+        """A browser treats localhost and 127.0.0.1 as different origins, so
+        allowing one does not allow the other."""
+        response = client.get("/health", headers={"Origin": "http://127.0.0.1:5173"})
+        assert (
+            response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+        )
+
+    def test_an_unconfigured_origin_gets_no_allow_header(self, client):
+        """The point of not defaulting to "*": an origin nobody configured is
+        not echoed back, so the browser blocks the read."""
+        response = client.get("/health", headers={"Origin": "https://example.invalid"})
+        assert "access-control-allow-origin" not in response.headers
+
+    def test_preflight_is_answered(self, client):
+        """A JSON request with a Content-Type header triggers a preflight; if
+        OPTIONS is not answered the real request is never sent."""
+        response = client.options(
+            "/api/v1/seasons",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        assert response.status_code == 200
+        assert (
+            response.headers["access-control-allow-origin"] == "http://localhost:5173"
+        )
+        assert "GET" in response.headers["access-control-allow-methods"]
+
+
+class TestCorsSettings:
+    def test_origins_are_split_on_commas(self):
+        from app.config import Settings
+
+        settings = Settings(cors_origins="https://a.example, https://b.example")
+        assert settings.cors_origin_list == ["https://a.example", "https://b.example"]
+
+    def test_blank_entries_are_dropped(self):
+        """A trailing comma in a .env file would otherwise become an empty
+        origin, which matches nothing and silently looks like a typo."""
+        from app.config import Settings
+
+        assert Settings(cors_origins="https://a.example,,").cors_origin_list == [
+            "https://a.example"
+        ]
+
+    def test_the_default_is_not_a_wildcard(self):
+        """Checks the field default rather than a loaded Settings, so the
+        assertion is about the committed code and not about whoever's .env
+        happens to be on disk."""
+        from app.config import Settings
+
+        default = Settings.model_fields["cors_origins"].default
+        assert "*" not in default
+        assert default == "http://localhost:5173,http://127.0.0.1:5173"
