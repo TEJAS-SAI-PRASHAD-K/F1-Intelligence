@@ -36,6 +36,24 @@ def get_laps(
     limit: int = Query(2000, le=10000),
     db: OrmSession = Depends(get_db),
 ):
+    """Laps for one session, optionally filtered.
+
+    `accurate_only` and `green_only` are two different quality filters, and
+    neither implies the other. `accurate_only` is FastF1's own flag, which
+    drops in-laps, out-laps and timing dropouts. `green_only` keeps a lap
+    only if its `track_status` is exactly `[1]`, so a lap that was partly
+    under a yellow is excluded -- drivers lift for yellows, which makes the
+    time unrepresentative of pace.
+
+    **Both together are still not enough for pace modeling.** A standing
+    restart after a red flag passes both filters: Mexico 2023 lap 36 records
+    148.5s against an ~83s norm, because it includes time stationary on the
+    grid. Anything fitting a curve to these lap times needs a pace-based
+    outlier filter of its own; `cli.py doctor` reports the count.
+
+    `lap_time_ms` is NULL where FastF1 had no time for the lap. NULL is not
+    zero, and is deliberately kept distinct from it.
+    """
     _require_session(db, session_id)
 
     stmt = (
@@ -85,6 +103,21 @@ def get_laps(
 
 @router.get("/{session_id}/results", response_model=list[ResultOut])
 def get_results(session_id: int, db: OrmSession = Depends(get_db)):
+    """Classified finishing order for one session.
+
+    `position` is the *classified* position, which every starter receives.
+    A retirement still carries one, so position alone does not tell you who
+    saw the flag -- read `status` for that.
+
+    `time_ms` is present for `Finished` and `Lapped`, and NULL for `+N Lap`
+    and for every retirement status. A NULL time therefore does not mean the
+    driver failed to finish; check `status` rather than inferring it.
+
+    For qualifying sessions `status` is always NULL, where it has no
+    meaning. `points` covers races only: sprints are not ingested, so on a
+    sprint weekend these totals fall short of the official championship
+    numbers.
+    """
     _require_session(db, session_id)
     rows = db.execute(
         select(SessionResult, Driver, Team.name)
