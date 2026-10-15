@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import (
     catalog,
@@ -50,6 +51,19 @@ def create_app() -> FastAPI:
             "to each weekend's allocation, so a Monza soft and a Monaco soft are "
             "different rubber."
         ),
+    )
+
+    # Without this a browser on any other origin cannot read a response at all,
+    # which is how the separate React frontend is served in development. The
+    # allowed origins come from CORS_ORIGINS (comma-separated) so a deployment
+    # can name its own; the default covers only the local Vite dev server. See
+    # Settings.cors_origins for why the default is not "*".
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     app.include_router(health.router)
